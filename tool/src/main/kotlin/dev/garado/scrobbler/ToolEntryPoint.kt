@@ -1,4 +1,4 @@
-package dev.garado.template
+package dev.garado.scrobbler
 
 import android.util.Log
 import com.thelightphone.sdk.EntryPoint
