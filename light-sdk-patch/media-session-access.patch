@@ -1,0 +1,151 @@
+diff --git a/plugin/src/main/kotlin/com/thelightphone/plugin/LightToolMetadata.kt b/plugin/src/main/kotlin/com/thelightphone/plugin/LightToolMetadata.kt
+index 7269370..0342170 100644
+--- a/plugin/src/main/kotlin/com/thelightphone/plugin/LightToolMetadata.kt
++++ b/plugin/src/main/kotlin/com/thelightphone/plugin/LightToolMetadata.kt
+@@ -188,8 +188,9 @@ object LightToolPolicy {
+     )
+ 
+     const val DETACHED_AUDIO: String = "detached-audio"
++    const val MEDIA_SESSION_ACCESS: String = "media-session-access"
+ 
+-    val ALLOWED_CAPABILITIES: Set<String> = setOf(DETACHED_AUDIO)
++    val ALLOWED_CAPABILITIES: Set<String> = setOf(DETACHED_AUDIO, MEDIA_SESSION_ACCESS)
+ 
+     /**
+      * Permissions a capability contributes to the generated manifest. These are
+diff --git a/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt b/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt
+index 65a2c4a..925f862 100644
+--- a/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt
++++ b/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt
+@@ -61,6 +61,19 @@ object ManifestGenerator {
+                 """        </service>""",
+             )
+         )
++        // Gate for reading other apps' MediaControllers; still needs a user grant in Settings.
++        val mediaSessionAccessService = marginBlock(
++            if (LightToolPolicy.MEDIA_SESSION_ACCESS !in metadata.capabilities) emptyList() else listOf(
++                """        <service""",
++                """            android:name="com.thelightphone.sdk.media.LightMediaSessionListenerService"""",
++                """            android:exported="true"""",
++                """            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">""",
++                """            <intent-filter>""",
++                """                <action android:name="android.service.notification.NotificationListenerService" />""",
++                """            </intent-filter>""",
++                """        </service>""",
++            )
++        )
+         appendLine(
+             """
+             |    <application
+@@ -91,7 +104,7 @@ object ManifestGenerator {
+             |            <meta-data
+             |                android:name="com.thelightphone.sdk.SDK_VERSION"
+             |                android:value="${'$'}{sdkVersion}" />
+-            |        </receiver>$detachedAudioService
++            |        </receiver>$detachedAudioService$mediaSessionAccessService
+             |    </application>
+             |    <queries>
+             |        <intent>
+diff --git a/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt b/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt
+new file mode 100644
+index 0000000..00e7139
+--- /dev/null
++++ b/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt
+@@ -0,0 +1,97 @@
++package com.thelightphone.sdk.media
++
++import android.content.ComponentName
++import android.content.Context
++import android.content.Intent
++import android.media.MediaMetadata
++import android.media.session.MediaController
++import android.media.session.MediaSessionManager
++import android.media.session.PlaybackState
++import android.provider.Settings
++import android.service.notification.NotificationListenerService
++import android.service.notification.StatusBarNotification
++import com.thelightphone.sdk.SealedLightContext
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** Now-playing metadata read from the OS's active [MediaController]s. */
++data class LightNowPlayingTrack(
++    val artist: String?,
++    val title: String?,
++    val album: String?,
++    val isPlaying: Boolean,
++)
++
++/** Device-wide now-playing state. Needs the `media-session-access` capability + user grant via [requestAccess]. */
++object LightMediaSessionAccess {
++    private val _nowPlaying = MutableStateFlow<LightNowPlayingTrack?>(null)
++    val nowPlaying: StateFlow<LightNowPlayingTrack?> = _nowPlaying.asStateFlow()
++
++    /** Whether the user has granted this tool notification-listener access. */
++    fun isGranted(lightContext: SealedLightContext): Boolean {
++        val context = lightContext.androidContext
++        val flat = Settings.Secure.getString(
++            context.contentResolver,
++            "enabled_notification_listeners",
++        )
++        return flat.orEmpty().split(":").any {
++            ComponentName.unflattenFromString(it)?.packageName == context.packageName
++        }
++    }
++
++    /** Opens the OS settings screen where the user can grant listener access. */
++    fun requestAccess(lightContext: SealedLightContext) {
++        lightContext.androidContext.startActivity(
++            Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
++        )
++    }
++
++    internal fun update(controllers: List<MediaController>) {
++        val active = controllers.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
++            ?: controllers.firstOrNull()
++        val metadata = active?.metadata
++
++        _nowPlaying.value = if (active == null || metadata == null) {
++            null
++        } else {
++            LightNowPlayingTrack(
++                artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST),
++                title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE),
++                album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM),
++                isPlaying = active.playbackState?.state == PlaybackState.STATE_PLAYING,
++            )
++        }
++    }
++
++    internal fun clear() {
++        _nowPlaying.value = null
++    }
++}
++
++/** Notification listener for fetching [MediaSessionManager.getActiveSessions] */
++class LightMediaSessionListenerService : NotificationListenerService() {
++
++    private val sessionsChangedListener =
++        MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
++            LightMediaSessionAccess.update(controllers.orEmpty())
++        }
++
++    override fun onListenerConnected() {
++        super.onListenerConnected()
++        val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
++        val component = ComponentName(this, LightMediaSessionListenerService::class.java)
++        manager.addOnActiveSessionsChangedListener(sessionsChangedListener, component)
++        LightMediaSessionAccess.update(manager.getActiveSessions(component))
++    }
++
++    override fun onListenerDisconnected() {
++        super.onListenerDisconnected()
++        val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
++        manager.removeOnActiveSessionsChangedListener(sessionsChangedListener)
++        LightMediaSessionAccess.clear()
++    }
++
++    override fun onNotificationPosted(sbn: StatusBarNotification) {}
++    override fun onNotificationRemoved(sbn: StatusBarNotification) {}
++}
