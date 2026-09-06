@@ -111,7 +111,10 @@ internal class LastFmApi {
         Unit
     }
 
-    /** Whether Last.fm recognizes this artist/track pair. */
+    /**
+     * Whether Last.fm recognizes this artist/track pair, used to avoid scrobbling garbage.
+     * Fails open on error.
+     */
     suspend fun trackExists(apiKey: String, artist: String, track: String): Boolean {
         return runCatching {
             val response = client.get(LAST_FM_API_BASE) {

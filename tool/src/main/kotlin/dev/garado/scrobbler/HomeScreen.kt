@@ -45,8 +45,6 @@ import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -70,7 +68,7 @@ private val CredentialField.preferenceKey: Preferences.Key<String>
         CredentialField.PASSWORD -> ScrobblerPreferences.PASSWORD
     }
 
-private const val MIN_LISTEN_BEFORE_SCROBBLE_MS = 30_000L
+private const val MIN_LISTEN_BEFORE_SCROBBLE_SECONDS = 30L
 
 sealed interface LoginState {
     data object LoggedOut : LoginState
@@ -94,8 +92,9 @@ class HomeScreenViewModel(
     val loginState: StateFlow<LoginState> = _loginState.asStateFlow()
 
     private var sessionKey: String? = null
-    private var scrobbledTrack: TrackKey? = null
-    private var scrobbleJob: Job? = null
+    private var currentTrack: TrackKey? = null
+    private var currentTrackStartedAtEpochSeconds: Long = 0
+    private var currentTrackWasPlaying = false
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -119,32 +118,50 @@ class HomeScreenViewModel(
     private data class TrackKey(val artist: String, val title: String, val album: String?)
 
     private fun onNowPlayingChanged(track: LightNowPlayingTrack?) {
-        val key = track?.takeIf { it.isPlaying }
-            ?.let { t ->
-                val artist = t.artist?.takeIf { it.isNotBlank() }
-                val title = t.title?.takeIf { it.isNotBlank() }
-                if (artist == null || title == null) null else TrackKey(artist, title, t.album)
-            }
+        val identity = track?.let { t ->
+            val artist = t.artist?.takeIf { it.isNotBlank() }
+            val title = t.title?.takeIf { it.isNotBlank() }
+            if (artist == null || title == null) null else TrackKey(artist, title, t.album)
+        }
+        val isPlaying = track?.isPlaying == true
 
-        if (key == scrobbledTrack) return
-        scrobbleJob?.cancel()
-        scrobbledTrack = key
-        if (key == null) return
+        // Only a real track change finalizes/resets
+        // TODO need to patch sdk further to expose track position / duration
+        if (identity != currentTrack) {
+            scrobbleIfEligible(currentTrack, currentTrackStartedAtEpochSeconds)
+            currentTrack = identity
+            currentTrackStartedAtEpochSeconds = System.currentTimeMillis() / 1000
+            currentTrackWasPlaying = false
+        }
+
+        // Push "now playing" only on track start or track resume
+        val justStartedPlaying = isPlaying && !currentTrackWasPlaying
+        currentTrackWasPlaying = isPlaying
+        if (identity == null || !justStartedPlaying) return
 
         val sk = sessionKey ?: return
         val apiKey = _credentials.value[CredentialField.API_KEY].orEmpty()
         val apiSecret = _credentials.value[CredentialField.API_SECRET].orEmpty()
         if (apiKey.isEmpty() || apiSecret.isEmpty()) return
 
-        val startedAtEpochSeconds = System.currentTimeMillis() / 1000
-        scrobbleJob = viewModelScope.launch(Dispatchers.IO) {
-            api.updateNowPlaying(apiKey, apiSecret, sk, key.artist, key.title, key.album)
+        viewModelScope.launch(Dispatchers.IO) {
+            api.updateNowPlaying(apiKey, apiSecret, sk, identity.artist, identity.title, identity.album)
+        }
+    }
 
-            // Last.fm requires the client to know track duration to apply the real
-            // scrobble rule (50% played or 4 minutes, whichever is less). The SDK's
-            // now-playing metadata doesn't expose duration, so approximate with a
-            // fixed minimum listen time instead.
-            delay(MIN_LISTEN_BEFORE_SCROBBLE_MS)
+    // Scrobbles a track once it's been replaced by another, not while it's still playing.
+    private fun scrobbleIfEligible(track: TrackKey?, startedAtEpochSeconds: Long) {
+        val key = track ?: return
+        val elapsedSeconds = System.currentTimeMillis() / 1000 - startedAtEpochSeconds
+        // No track duration available, so approximate Last.fm's 50%/4min rule with a flat minimum.
+        if (elapsedSeconds < MIN_LISTEN_BEFORE_SCROBBLE_SECONDS) return
+
+        val sk = sessionKey ?: return
+        val apiKey = _credentials.value[CredentialField.API_KEY].orEmpty()
+        val apiSecret = _credentials.value[CredentialField.API_SECRET].orEmpty()
+        if (apiKey.isEmpty() || apiSecret.isEmpty()) return
+
+        viewModelScope.launch(Dispatchers.IO) {
             if (!api.trackExists(apiKey, key.artist, key.title)) return@launch
             api.scrobble(apiKey, apiSecret, sk, key.artist, key.title, key.album, startedAtEpochSeconds)
         }
@@ -174,9 +191,8 @@ class HomeScreenViewModel(
         _isScanning.value = false
     }
 
-    // LightTextInputEditor caches its embedded keyboard's ViewModel by editorKey;
-    // bump this each time editing starts so a stale keyboard/TextFieldState pairing
-    // from a previous session isn't reused
+    // LightTextInputEditor caches its embedded keyboard's ViewModel by editorKey.
+    // Bump this each time editing starts so a stale keyboard/state from prev session isn't reused
     private val _editSessionId = MutableStateFlow(0)
     val editSessionId: StateFlow<Int> = _editSessionId.asStateFlow()
 
@@ -228,8 +244,8 @@ class HomeScreenViewModel(
 
     fun logOut() {
         sessionKey = null
-        scrobbleJob?.cancel()
-        scrobbledTrack = null
+        currentTrack = null
+        currentTrackWasPlaying = false
         _loginState.value = LoginState.LoggedOut
         viewModelScope.launch(Dispatchers.IO) {
             dataStore.edit { prefs -> prefs.remove(ScrobblerPreferences.SESSION_KEY) }
