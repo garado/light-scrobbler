@@ -7,4 +7,5 @@ internal object ScrobblerPreferences {
     val API_SECRET = stringPreferencesKey("api_secret")
     val USERNAME = stringPreferencesKey("username")
     val PASSWORD = stringPreferencesKey("password")
+    val SESSION_KEY = stringPreferencesKey("session_key")
 }

@@ -68,14 +68,26 @@ private val CredentialField.preferenceKey: Preferences.Key<String>
         CredentialField.PASSWORD -> ScrobblerPreferences.PASSWORD
     }
 
+sealed interface LoginState {
+    data object LoggedOut : LoginState
+    data object LoggingIn : LoginState
+    data class LoggedIn(val username: String) : LoginState
+    data class Error(val message: String) : LoginState
+}
+
 class HomeScreenViewModel(
     private val dataStore: DataStore<Preferences>,
 ) : LightViewModel<Unit>() {
     val nowPlaying: StateFlow<LightNowPlayingTrack?> = LightMediaSessionAccess.nowPlaying
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
+    private val api = LastFmApi()
+
     private val _credentials = MutableStateFlow(CredentialField.entries.associateWith { "" })
     val credentials: StateFlow<Map<CredentialField, String>> = _credentials.asStateFlow()
+
+    private val _loginState = MutableStateFlow<LoginState>(LoginState.LoggedOut)
+    val loginState: StateFlow<LoginState> = _loginState.asStateFlow()
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -83,7 +95,17 @@ class HomeScreenViewModel(
             _credentials.value = CredentialField.entries.associateWith { field ->
                 prefs[field.preferenceKey].orEmpty()
             }
+            val sessionKey = prefs[ScrobblerPreferences.SESSION_KEY]
+            val username = prefs[CredentialField.USERNAME.preferenceKey]
+            if (!sessionKey.isNullOrEmpty() && !username.isNullOrEmpty()) {
+                _loginState.value = LoginState.LoggedIn(username)
+            }
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        api.close()
     }
 
     private val _editingField = MutableStateFlow<CredentialField?>(null)
@@ -131,7 +153,36 @@ class HomeScreenViewModel(
     }
 
     fun logIn() {
-        // TODO: authenticate with Last.fm using stored credentials
+        val creds = _credentials.value
+        val apiKey = creds[CredentialField.API_KEY].orEmpty()
+        val apiSecret = creds[CredentialField.API_SECRET].orEmpty()
+        val username = creds[CredentialField.USERNAME].orEmpty()
+        val password = creds[CredentialField.PASSWORD].orEmpty()
+
+        if (apiKey.isEmpty() || apiSecret.isEmpty() || username.isEmpty() || password.isEmpty()) {
+            _loginState.value = LoginState.Error("Fill in all fields before logging in.")
+            return
+        }
+
+        _loginState.value = LoginState.LoggingIn
+        viewModelScope.launch(Dispatchers.IO) {
+            api.getMobileSession(apiKey, apiSecret, username, password).fold(
+                onSuccess = { session ->
+                    dataStore.edit { prefs -> prefs[ScrobblerPreferences.SESSION_KEY] = session.key }
+                    _loginState.value = LoginState.LoggedIn(session.name)
+                },
+                onFailure = { error ->
+                    _loginState.value = LoginState.Error(error.message ?: "Login failed.")
+                },
+            )
+        }
+    }
+
+    fun logOut() {
+        _loginState.value = LoginState.LoggedOut
+        viewModelScope.launch(Dispatchers.IO) {
+            dataStore.edit { prefs -> prefs.remove(ScrobblerPreferences.SESSION_KEY) }
+        }
     }
 }
 
@@ -160,6 +211,7 @@ class HomeScreen(sealedActivity: SealedLightActivity) : LightScreen<Unit, HomeSc
         val editingField by viewModel.editingField.collectAsState()
         val editSessionId by viewModel.editSessionId.collectAsState()
         val isScanning by viewModel.isScanning.collectAsState()
+        val loginState by viewModel.loginState.collectAsState()
 
         LightTheme(colors = themeColors) {
             val fieldBeingEdited = editingField
@@ -236,21 +288,53 @@ class HomeScreen(sealedActivity: SealedLightActivity) : LightScreen<Unit, HomeSc
                                 .lightClickable(onClick = { LightMediaSessionAccess.requestAccess(lightContext) }),
                         )
 
-                        CredentialField.entries.forEach { field ->
-                            val value = credentials[field].orEmpty()
-                            LightTextField(
-                                label = field.label,
-                                value = if (field.isSecret) "•".repeat(value.length) else value,
-                                placeholder = "Enter ${field.label.lowercase()}",
-                                onClick = { viewModel.startEditing(field) },
-                                modifier = Modifier.padding(bottom = 16.dp),
+                        val loggedInState = loginState as? LoginState.LoggedIn
+                        if (loggedInState != null) {
+                            LightText(
+                                text = "Logged in as",
+                                variant = LightTextVariant.Detail,
                             )
+                            LightText(
+                                text = loggedInState.username,
+                                variant = LightTextVariant.Copy,
+                                modifier = Modifier.padding(top = 2.dp, bottom = 16.dp),
+                            )
+                        } else {
+                            CredentialField.entries.forEach { field ->
+                                val value = credentials[field].orEmpty()
+                                LightTextField(
+                                    label = field.label,
+                                    value = if (field.isSecret) "•".repeat(value.length) else value,
+                                    placeholder = "Enter ${field.label.lowercase()}",
+                                    onClick = { viewModel.startEditing(field) },
+                                    modifier = Modifier.padding(bottom = 16.dp),
+                                )
+                            }
+
+                            val errorState = loginState as? LoginState.Error
+                            if (errorState != null) {
+                                LightText(
+                                    text = errorState.message,
+                                    variant = LightTextVariant.Copy,
+                                )
+                            }
                         }
                     }
 
                     LightBottomBar(
                         items = listOf(
-                            LightBarButton.Text(text = "LOG IN", onClick = { viewModel.logIn() }),
+                            LightBarButton.Text(
+                                text = when (loginState) {
+                                    is LoginState.LoggedIn -> "LOG OUT"
+                                    is LoginState.LoggingIn -> "LOGGING IN..."
+                                    else -> "LOG IN"
+                                },
+                                onClick = when (loginState) {
+                                    is LoginState.LoggedIn -> ({ viewModel.logOut() })
+                                    is LoginState.LoggingIn -> null
+                                    else -> ({ viewModel.logIn() })
+                                },
+                            ),
                         ),
                     )
                 }
