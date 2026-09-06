@@ -5,6 +5,8 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.forms.submitForm
+import io.ktor.client.request.get
+import io.ktor.client.request.parameter
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.Parameters
 import io.ktor.http.isSuccess
@@ -15,6 +17,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
 private const val LAST_FM_API_BASE = "https://ws.audioscrobbler.com/2.0/"
+private const val LAST_FM_ERROR_TRACK_NOT_FOUND = 6
 
 @Serializable
 internal data class MobileSessionResponse(
@@ -106,6 +109,22 @@ internal class LastFmApi {
             },
         )
         Unit
+    }
+
+    /** Whether Last.fm recognizes this artist/track pair. */
+    suspend fun trackExists(apiKey: String, artist: String, track: String): Boolean {
+        return runCatching {
+            val response = client.get(LAST_FM_API_BASE) {
+                parameter("method", "track.getInfo")
+                parameter("api_key", apiKey)
+                parameter("artist", artist)
+                parameter("track", track)
+                parameter("format", "json")
+            }
+            if (response.status.isSuccess()) return@runCatching true
+            val parsed = json.decodeFromString<LastFmErrorResponse>(response.bodyAsText())
+            parsed.errorCode != LAST_FM_ERROR_TRACK_NOT_FOUND
+        }.getOrDefault(true)
     }
 
     private suspend fun call(

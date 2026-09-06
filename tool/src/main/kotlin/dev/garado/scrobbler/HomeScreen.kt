@@ -145,6 +145,7 @@ class HomeScreenViewModel(
             // now-playing metadata doesn't expose duration, so approximate with a
             // fixed minimum listen time instead.
             delay(MIN_LISTEN_BEFORE_SCROBBLE_MS)
+            if (!api.trackExists(apiKey, key.artist, key.title)) return@launch
             api.scrobble(apiKey, apiSecret, sk, key.artist, key.title, key.album, startedAtEpochSeconds)
         }
     }
