@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.Composable
@@ -27,6 +28,8 @@ import com.thelightphone.sdk.LightViewModel
 import com.thelightphone.sdk.SealedLightActivity
 import com.thelightphone.sdk.media.LightMediaSessionAccess
 import com.thelightphone.sdk.media.LightNowPlayingTrack
+import com.thelightphone.sdk.ui.LightBarButton
+import com.thelightphone.sdk.ui.LightBottomBar
 import com.thelightphone.sdk.ui.LightIcon
 import com.thelightphone.sdk.ui.LightIcons
 import com.thelightphone.sdk.ui.LightScrollView
@@ -126,6 +129,10 @@ class HomeScreenViewModel(
     fun cancelEditing() {
         _editingField.value = null
     }
+
+    fun logIn() {
+        // TODO: authenticate with Last.fm using stored credentials
+    }
 }
 
 @InitialScreen
@@ -202,8 +209,9 @@ class HomeScreen(sealedActivity: SealedLightActivity) : LightScreen<Unit, HomeSc
 
                     LightScrollView(
                         modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = 16.dp, vertical = 16.dp),
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .padding(horizontal = 16.dp),
                     ) {
                         LightText(
                             text = "Now playing",
@@ -239,6 +247,12 @@ class HomeScreen(sealedActivity: SealedLightActivity) : LightScreen<Unit, HomeSc
                             )
                         }
                     }
+
+                    LightBottomBar(
+                        items = listOf(
+                            LightBarButton.Text(text = "LOG IN", onClick = { viewModel.logIn() }),
+                        ),
+                    )
                 }
             }
         }
