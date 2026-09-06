@@ -29,6 +29,12 @@ internal data class MobileSession(
     val key: String,
 )
 
+@Serializable
+internal data class LastFmErrorResponse(
+    @SerialName("error") val errorCode: Int? = null,
+    @SerialName("message") val errorMessage: String? = null,
+)
+
 internal class LastFmAuthException(message: String) : Exception(message)
 
 internal class LastFmApi {
@@ -46,18 +52,75 @@ internal class LastFmApi {
         username: String,
         password: String,
     ): Result<MobileSession> = runCatching {
-        val params = sortedMapOf(
-            "method" to "auth.getMobileSession",
-            "api_key" to apiKey,
-            "username" to username,
-            "password" to password,
+        val body = call(
+            method = "auth.getMobileSession",
+            apiKey = apiKey,
+            apiSecret = apiSecret,
+            params = mapOf("username" to username, "password" to password),
         )
-        val signature = signParams(params, apiSecret)
+        val parsed = json.decodeFromString<MobileSessionResponse>(body)
+        parsed.session ?: throw LastFmAuthException(parsed.errorMessage ?: "Login failed.")
+    }
+
+    suspend fun updateNowPlaying(
+        apiKey: String,
+        apiSecret: String,
+        sessionKey: String,
+        artist: String,
+        track: String,
+        album: String?,
+    ): Result<Unit> = runCatching {
+        call(
+            method = "track.updateNowPlaying",
+            apiKey = apiKey,
+            apiSecret = apiSecret,
+            params = buildMap {
+                put("sk", sessionKey)
+                put("artist", artist)
+                put("track", track)
+                if (!album.isNullOrBlank()) put("album", album)
+            },
+        )
+        Unit
+    }
+
+    suspend fun scrobble(
+        apiKey: String,
+        apiSecret: String,
+        sessionKey: String,
+        artist: String,
+        track: String,
+        album: String?,
+        timestampEpochSeconds: Long,
+    ): Result<Unit> = runCatching {
+        call(
+            method = "track.scrobble",
+            apiKey = apiKey,
+            apiSecret = apiSecret,
+            params = buildMap {
+                put("sk", sessionKey)
+                put("artist[0]", artist)
+                put("track[0]", track)
+                put("timestamp[0]", timestampEpochSeconds.toString())
+                if (!album.isNullOrBlank()) put("album[0]", album)
+            },
+        )
+        Unit
+    }
+
+    private suspend fun call(
+        method: String,
+        apiKey: String,
+        apiSecret: String,
+        params: Map<String, String>,
+    ): String {
+        val allParams = params + mapOf("method" to method, "api_key" to apiKey)
+        val signature = signParams(allParams, apiSecret)
 
         val response = client.submitForm(
             url = LAST_FM_API_BASE,
             formParameters = Parameters.build {
-                params.forEach { (key, value) -> append(key, value) }
+                allParams.forEach { (key, value) -> append(key, value) }
                 append("api_sig", signature)
                 append("format", "json")
             },
@@ -65,12 +128,12 @@ internal class LastFmApi {
 
         val body = response.bodyAsText()
         if (!response.status.isSuccess()) {
-            val parsed = runCatching { json.decodeFromString<MobileSessionResponse>(body) }.getOrNull()
-            throw LastFmAuthException(parsed?.errorMessage ?: "Login failed (HTTP ${response.status.value}).")
+            val parsed = runCatching { json.decodeFromString<LastFmErrorResponse>(body) }.getOrNull()
+            throw LastFmAuthException(
+                parsed?.errorMessage ?: "$method failed (HTTP ${response.status.value}).",
+            )
         }
-
-        val parsed = json.decodeFromString<MobileSessionResponse>(body)
-        parsed.session ?: throw LastFmAuthException(parsed.errorMessage ?: "Login failed.")
+        return body
     }
 
     fun close() {

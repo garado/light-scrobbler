@@ -45,6 +45,8 @@ import com.thelightphone.sdk.ui.LightTopBarCenter
 import com.thelightphone.sdk.ui.gridUnitsAsDp
 import com.thelightphone.sdk.ui.lightClickable
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -68,6 +70,8 @@ private val CredentialField.preferenceKey: Preferences.Key<String>
         CredentialField.PASSWORD -> ScrobblerPreferences.PASSWORD
     }
 
+private const val MIN_LISTEN_BEFORE_SCROBBLE_MS = 30_000L
+
 sealed interface LoginState {
     data object LoggedOut : LoginState
     data object LoggingIn : LoginState
@@ -89,17 +93,59 @@ class HomeScreenViewModel(
     private val _loginState = MutableStateFlow<LoginState>(LoginState.LoggedOut)
     val loginState: StateFlow<LoginState> = _loginState.asStateFlow()
 
+    private var sessionKey: String? = null
+    private var scrobbledTrack: TrackKey? = null
+    private var scrobbleJob: Job? = null
+
     init {
         viewModelScope.launch(Dispatchers.IO) {
             val prefs = dataStore.data.first()
             _credentials.value = CredentialField.entries.associateWith { field ->
                 prefs[field.preferenceKey].orEmpty()
             }
-            val sessionKey = prefs[ScrobblerPreferences.SESSION_KEY]
+            val storedSessionKey = prefs[ScrobblerPreferences.SESSION_KEY]
             val username = prefs[CredentialField.USERNAME.preferenceKey]
-            if (!sessionKey.isNullOrEmpty() && !username.isNullOrEmpty()) {
+            if (!storedSessionKey.isNullOrEmpty() && !username.isNullOrEmpty()) {
+                sessionKey = storedSessionKey
                 _loginState.value = LoginState.LoggedIn(username)
             }
+        }
+
+        viewModelScope.launch {
+            nowPlaying.collect { onNowPlayingChanged(it) }
+        }
+    }
+
+    private data class TrackKey(val artist: String, val title: String, val album: String?)
+
+    private fun onNowPlayingChanged(track: LightNowPlayingTrack?) {
+        val key = track?.takeIf { it.isPlaying }
+            ?.let { t ->
+                val artist = t.artist?.takeIf { it.isNotBlank() }
+                val title = t.title?.takeIf { it.isNotBlank() }
+                if (artist == null || title == null) null else TrackKey(artist, title, t.album)
+            }
+
+        if (key == scrobbledTrack) return
+        scrobbleJob?.cancel()
+        scrobbledTrack = key
+        if (key == null) return
+
+        val sk = sessionKey ?: return
+        val apiKey = _credentials.value[CredentialField.API_KEY].orEmpty()
+        val apiSecret = _credentials.value[CredentialField.API_SECRET].orEmpty()
+        if (apiKey.isEmpty() || apiSecret.isEmpty()) return
+
+        val startedAtEpochSeconds = System.currentTimeMillis() / 1000
+        scrobbleJob = viewModelScope.launch(Dispatchers.IO) {
+            api.updateNowPlaying(apiKey, apiSecret, sk, key.artist, key.title, key.album)
+
+            // Last.fm requires the client to know track duration to apply the real
+            // scrobble rule (50% played or 4 minutes, whichever is less). The SDK's
+            // now-playing metadata doesn't expose duration, so approximate with a
+            // fixed minimum listen time instead.
+            delay(MIN_LISTEN_BEFORE_SCROBBLE_MS)
+            api.scrobble(apiKey, apiSecret, sk, key.artist, key.title, key.album, startedAtEpochSeconds)
         }
     }
 
@@ -169,6 +215,7 @@ class HomeScreenViewModel(
             api.getMobileSession(apiKey, apiSecret, username, password).fold(
                 onSuccess = { session ->
                     dataStore.edit { prefs -> prefs[ScrobblerPreferences.SESSION_KEY] = session.key }
+                    sessionKey = session.key
                     _loginState.value = LoginState.LoggedIn(session.name)
                 },
                 onFailure = { error ->
@@ -179,6 +226,9 @@ class HomeScreenViewModel(
     }
 
     fun logOut() {
+        sessionKey = null
+        scrobbleJob?.cancel()
+        scrobbledTrack = null
         _loginState.value = LoginState.LoggedOut
         viewModelScope.launch(Dispatchers.IO) {
             dataStore.edit { prefs -> prefs.remove(ScrobblerPreferences.SESSION_KEY) }
