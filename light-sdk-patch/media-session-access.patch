@@ -48,10 +48,10 @@ index 65a2c4a..925f862 100644
              |        <intent>
 diff --git a/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt b/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt
 new file mode 100644
-index 0000000..00e7139
+index 0000000..b99aa50
 --- /dev/null
 +++ b/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,137 @@
 +package com.thelightphone.sdk.media
 +
 +import android.content.ComponentName
@@ -126,23 +126,63 @@ index 0000000..00e7139
 +/** Notification listener for fetching [MediaSessionManager.getActiveSessions] */
 +class LightMediaSessionListenerService : NotificationListenerService() {
 +
++    // OnActiveSessionsChangedListener only fires when the set of active sessions
++    // changes, not when a controller's own track/playback state changes (e.g.
++    // skipping to the next song within the same session), so each controller also
++    // gets its own callback to catch those in-session updates.
++    private var trackedControllers: List<MediaController> = emptyList()
++    private val controllerCallbacks = mutableMapOf<MediaController, MediaController.Callback>()
++
 +    private val sessionsChangedListener =
 +        MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-+            LightMediaSessionAccess.update(controllers.orEmpty())
++            trackControllers(controllers.orEmpty())
 +        }
++
++    private fun trackControllers(controllers: List<MediaController>) {
++        val previous = trackedControllers
++        for (controller in previous) {
++            if (controller !in controllers) {
++                controllerCallbacks.remove(controller)?.let { controller.unregisterCallback(it) }
++            }
++        }
++        for (controller in controllers) {
++            if (controller !in controllerCallbacks) {
++                val callback = object : MediaController.Callback() {
++                    override fun onMetadataChanged(metadata: MediaMetadata?) {
++                        LightMediaSessionAccess.update(trackedControllers)
++                    }
++
++                    override fun onPlaybackStateChanged(state: PlaybackState?) {
++                        LightMediaSessionAccess.update(trackedControllers)
++                    }
++
++                    override fun onSessionDestroyed() {
++                        controllerCallbacks.remove(controller)
++                    }
++                }
++                controller.registerCallback(callback)
++                controllerCallbacks[controller] = callback
++            }
++        }
++        trackedControllers = controllers
++        LightMediaSessionAccess.update(controllers)
++    }
 +
 +    override fun onListenerConnected() {
 +        super.onListenerConnected()
 +        val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
 +        val component = ComponentName(this, LightMediaSessionListenerService::class.java)
 +        manager.addOnActiveSessionsChangedListener(sessionsChangedListener, component)
-+        LightMediaSessionAccess.update(manager.getActiveSessions(component))
++        trackControllers(manager.getActiveSessions(component))
 +    }
 +
 +    override fun onListenerDisconnected() {
 +        super.onListenerDisconnected()
 +        val manager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
 +        manager.removeOnActiveSessionsChangedListener(sessionsChangedListener)
++        controllerCallbacks.forEach { (controller, callback) -> controller.unregisterCallback(callback) }
++        controllerCallbacks.clear()
++        trackedControllers = emptyList()
 +        LightMediaSessionAccess.clear()
 +    }
 +
