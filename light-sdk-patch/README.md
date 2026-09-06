@@ -17,5 +17,4 @@ git -C light-sdk checkout -- <relative/path/to/file>
 ```
 
 ## Patches
-
-None yet!
+- `01-media-session-access`: exposes OS-wide now-playing/playback info (artist, title, position, duration) so the scrobbler has something to read

@@ -69,6 +69,8 @@ private val CredentialField.preferenceKey: Preferences.Key<String>
     }
 
 private const val MIN_LISTEN_BEFORE_SCROBBLE_SECONDS = 30L
+private const val MAX_SCROBBLE_THRESHOLD_MS = 4 * 60 * 1000L
+private const val LOOP_BACKJUMP_THRESHOLD_MS = 5_000L
 
 sealed interface LoginState {
     data object LoggedOut : LoginState
@@ -95,6 +97,8 @@ class HomeScreenViewModel(
     private var currentTrack: TrackKey? = null
     private var currentTrackStartedAtEpochSeconds: Long = 0
     private var currentTrackWasPlaying = false
+    private var currentTrackDurationMs: Long? = null
+    private var lastPositionMs: Long? = null
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -124,14 +128,29 @@ class HomeScreenViewModel(
             if (artist == null || title == null) null else TrackKey(artist, title, t.album)
         }
         val isPlaying = track?.isPlaying == true
+        val positionMs = track?.positionMs
+        val durationMs = track?.durationMs
 
-        // Only a real track change finalizes/resets
-        // TODO need to patch sdk further to expose track position / duration
+        // Finalizes/reset on track change
         if (identity != currentTrack) {
-            scrobbleIfEligible(currentTrack, currentTrackStartedAtEpochSeconds)
+            scrobbleIfEligible(currentTrack, currentTrackStartedAtEpochSeconds, currentTrackDurationMs)
             currentTrack = identity
             currentTrackStartedAtEpochSeconds = System.currentTimeMillis() / 1000
             currentTrackWasPlaying = false
+            currentTrackDurationMs = durationMs
+            lastPositionMs = positionMs
+        } else {
+            // Same track, but position moved backwards (restart or manual scrub).
+            // Finalize this playthrough and start timing the next one
+            val previousPosition = lastPositionMs
+            if (previousPosition != null && positionMs != null &&
+                positionMs < previousPosition - LOOP_BACKJUMP_THRESHOLD_MS
+            ) {
+                scrobbleIfEligible(currentTrack, currentTrackStartedAtEpochSeconds, currentTrackDurationMs)
+                currentTrackStartedAtEpochSeconds = System.currentTimeMillis() / 1000
+            }
+            if (durationMs != null) currentTrackDurationMs = durationMs
+            lastPositionMs = positionMs
         }
 
         // Push "now playing" only on track start or track resume
@@ -149,12 +168,15 @@ class HomeScreenViewModel(
         }
     }
 
-    // Scrobbles a track once it's been replaced by another, not while it's still playing.
-    private fun scrobbleIfEligible(track: TrackKey?, startedAtEpochSeconds: Long) {
+    // Scrobbles a track once it's been replaced by another
+    private fun scrobbleIfEligible(track: TrackKey?, startedAtEpochSeconds: Long, durationMs: Long?) {
         val key = track ?: return
         val elapsedSeconds = System.currentTimeMillis() / 1000 - startedAtEpochSeconds
-        // No track duration available, so approximate Last.fm's 50%/4min rule with a flat minimum.
-        if (elapsedSeconds < MIN_LISTEN_BEFORE_SCROBBLE_SECONDS) return
+        // last.fm rules: scrobble on min(50% played, 4 minutes in) 
+        // Fall back to flat minimum if duration is not available for whatever reason
+        val thresholdSeconds = durationMs?.let { minOf(it / 2, MAX_SCROBBLE_THRESHOLD_MS) / 1000 }
+            ?: MIN_LISTEN_BEFORE_SCROBBLE_SECONDS
+        if (elapsedSeconds < thresholdSeconds) return
 
         val sk = sessionKey ?: return
         val apiKey = _credentials.value[CredentialField.API_KEY].orEmpty()
@@ -246,6 +268,8 @@ class HomeScreenViewModel(
         sessionKey = null
         currentTrack = null
         currentTrackWasPlaying = false
+        currentTrackDurationMs = null
+        lastPositionMs = null
         _loginState.value = LoginState.LoggedOut
         viewModelScope.launch(Dispatchers.IO) {
             dataStore.edit { prefs -> prefs.remove(ScrobblerPreferences.SESSION_KEY) }

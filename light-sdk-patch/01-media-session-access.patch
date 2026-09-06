@@ -14,14 +14,14 @@ index 7269370..0342170 100644
      /**
       * Permissions a capability contributes to the generated manifest. These are
 diff --git a/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt b/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt
-index 65a2c4a..925f862 100644
+index 65a2c4a..53ca044 100644
 --- a/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt
 +++ b/plugin/src/main/kotlin/com/thelightphone/plugin/ManifestGenerator.kt
 @@ -61,6 +61,19 @@ object ManifestGenerator {
                  """        </service>""",
              )
          )
-+        // Gate for reading other apps' MediaControllers; still needs a user grant in Settings.
++        // Gate for reading other apps' MediaControllers. (Requires user grant in Android Settings)
 +        val mediaSessionAccessService = marginBlock(
 +            if (LightToolPolicy.MEDIA_SESSION_ACCESS !in metadata.capabilities) emptyList() else listOf(
 +                """        <service""",
@@ -48,10 +48,10 @@ index 65a2c4a..925f862 100644
              |        <intent>
 diff --git a/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt b/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt
 new file mode 100644
-index 0000000..b99aa50
+index 0000000..4cd51f7
 --- /dev/null
 +++ b/sdk/client/src/main/kotlin/com/thelightphone/sdk/media/LightMediaSessionListenerService.kt
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,140 @@
 +package com.thelightphone.sdk.media
 +
 +import android.content.ComponentName
@@ -75,6 +75,8 @@ index 0000000..b99aa50
 +    val title: String?,
 +    val album: String?,
 +    val isPlaying: Boolean,
++    val positionMs: Long?,
++    val durationMs: Long?,
 +)
 +
 +/** Device-wide now-playing state. Needs the `media-session-access` capability + user grant via [requestAccess]. */
@@ -82,7 +84,7 @@ index 0000000..b99aa50
 +    private val _nowPlaying = MutableStateFlow<LightNowPlayingTrack?>(null)
 +    val nowPlaying: StateFlow<LightNowPlayingTrack?> = _nowPlaying.asStateFlow()
 +
-+    /** Whether the user has granted this tool notification-listener access. */
++    /** Whether the user has granted this tool notification-listener access */
 +    fun isGranted(lightContext: SealedLightContext): Boolean {
 +        val context = lightContext.androidContext
 +        val flat = Settings.Secure.getString(
@@ -109,11 +111,14 @@ index 0000000..b99aa50
 +        _nowPlaying.value = if (active == null || metadata == null) {
 +            null
 +        } else {
++            val durationMs = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION)
 +            LightNowPlayingTrack(
 +                artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST),
 +                title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE),
 +                album = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM),
 +                isPlaying = active.playbackState?.state == PlaybackState.STATE_PLAYING,
++                positionMs = active.playbackState?.position?.takeIf { it >= 0 },
++                durationMs = durationMs.takeIf { it > 0 },
 +            )
 +        }
 +    }
@@ -126,10 +131,8 @@ index 0000000..b99aa50
 +/** Notification listener for fetching [MediaSessionManager.getActiveSessions] */
 +class LightMediaSessionListenerService : NotificationListenerService() {
 +
-+    // OnActiveSessionsChangedListener only fires when the set of active sessions
-+    // changes, not when a controller's own track/playback state changes (e.g.
-+    // skipping to the next song within the same session), so each controller also
-+    // gets its own callback to catch those in-session updates.
++    // OnActiveSessionsChangedListener fires when the set of active sessions changes.
++    // Each controller also gets its own callback for when its track/playback state changes.
 +    private var trackedControllers: List<MediaController> = emptyList()
 +    private val controllerCallbacks = mutableMapOf<MediaController, MediaController.Callback>()
 +
